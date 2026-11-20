@@ -4,6 +4,7 @@ const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 const crypto = require('crypto');
+const { withInstallLock } = require('./src/install-lock');
 const { readAsarPackageVersion } = require('./asar-version');
 const { normalizeVersion } = require('./src/backup-utils');
 const {
@@ -144,6 +145,11 @@ function createPackageInstaller({
       skipped: true, backupReused: false };
     // An identical package needs no writes and should not close a running app.
     if (await hashFile(asarPath) === cache.sha256) return skippedResult;
+    return withInstallLock(resourcesDir, () => installAtTarget(cache, params, appDir, resourcesDir, skippedResult));
+  }
+
+  async function installAtTarget(cache, params, appDir, resourcesDir, skippedResult) {
+    const { asarPath } = skippedResult;
     // Block cross-version archive overwrites before stopping any active client [H-01].
     assertCompatiblePackageVersion(asarPath, cache.path);
     await stopBeforeInstall(params.forceStop === true);
@@ -269,6 +275,14 @@ function createPackageInstaller({
     return body;
   }
 
+  function installCached(params) {
+    const run = () => releaseManager.withCachedFile(params.cacheId, cache => install(cache, params));
+    return typeof writeLock?.tryRun === 'function' ? writeLock.tryRun(run, {
+      owner: 'release-install',
+      conflictMessage: '已有汉化、恢复或安装操作正在进行，请等待完成后重试'
+    }) : run();
+  }
+
   function handleRequest(req, res) {
     let url;
     try { url = new URL(req.url, 'http://localhost'); } catch (_) { return false; }
@@ -277,14 +291,7 @@ function createPackageInstaller({
       if (req.method !== 'POST') throw failure('此接口仅支持 POST', 405);
       checkOrigin(req);
       const params = await readBody(req);
-      const runInstall = () => releaseManager.withCachedFile(params.cacheId, cache => install(cache, params));
-      if (writeLock && typeof writeLock.tryRun === 'function') {
-        return writeLock.tryRun(runInstall, {
-          owner: 'release-install',
-          conflictMessage: '已有汉化、恢复或安装操作正在进行，请等待完成后重试'
-        });
-      }
-      return runInstall();
+      return installCached(params);
     })().then(installed => {
       if (res.destroyed || res.writableEnded) return;
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -298,7 +305,7 @@ function createPackageInstaller({
     return true;
   }
 
-  return { handleRequest };
+  return { handleRequest, installCached };
 }
 
 module.exports = { createPackageInstaller };

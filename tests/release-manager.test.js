@@ -41,7 +41,7 @@ async function fixture(t, serve, options = {}) {
     request(url, config, callback) {
       assert.equal(url.protocol, 'https:');
       return http.request({ host: '127.0.0.1', port: upstreamPort, path: url.pathname + url.search,
-        headers: { ...config.headers, 'x-test-host': url.hostname } }, callback);
+        method: config.method, headers: { ...config.headers, 'x-test-host': url.hostname } }, callback);
     } });
   const app = http.createServer((req, res) => {
     if (!manager.handleRequest(req, res)) { res.writeHead(404); res.end('{}'); }
@@ -90,6 +90,45 @@ async function fixture(t, serve, options = {}) {
   }
   return { call, waitFor, workspaceDir, port, manager };
 }
+
+test('latest release falls back to the public tagged assets and verifies the published checksum', async t => {
+  const bytes = Buffer.from('latest public archive');
+  const publicPath = `/${REPO}/releases`;
+  const versionPath = publicPath + '/download/v2.33.0/';
+  const f = await fixture(t, (req, res) => {
+    if (req.url === API + '/latest') return res.writeHead(403).end();
+    if (req.url === publicPath + '/latest' && req.method === 'HEAD') {
+      return res.writeHead(302, { Location: publicPath + '/tag/v2.33.0' }).end();
+    }
+    if (req.url === publicPath + '/tag/v2.33.0') return res.end();
+    if (req.url === versionPath + 'app.asar.ready') return res.writeHead(404).end();
+    if (req.url === versionPath + 'app.asar') {
+      res.setHeader('Content-Length', bytes.length);
+      return res.end(bytes);
+    }
+    if (req.url === versionPath + 'SHA256SUMS.txt') return res.end(`${sha256(bytes)}  app.asar\n`);
+    throw new Error('Unexpected upstream path: ' + req.url);
+  });
+  const latest = await f.manager.getLatestRelease();
+  assert.equal(latest.tag, 'v2.33.0');
+  assert.equal(latest.asset.name, 'app.asar');
+  assert.equal(latest.asset.size, bytes.length);
+  await f.manager.startLatestDownload();
+  const download = await f.waitFor(item => item.status !== 'downloading');
+  assert.equal(download.verified, true, download.error);
+  assert.deepEqual(await fs.readFile(download.path), bytes);
+  const [cached] = await f.manager.listFiles();
+  assert.equal(cached.releaseId, null);
+  assert.equal(cached.sha256, sha256(bytes));
+});
+
+test('public latest fallback rejects a redirect into another GitHub repository', async t => {
+  const f = await fixture(t, (req, res) => {
+    if (req.url === API + '/latest') return res.writeHead(429).end();
+    return res.writeHead(302, { Location: '/some-owner/another/repo/releases/tag/v2.33.0' }).end();
+  });
+  await assert.rejects(f.manager.getLatestRelease(), /指定仓库/);
+});
 
 test('release list filters drafts, prefers ready, supports fallback and caches pagination', async t => {
   let requests = 0;
@@ -262,10 +301,19 @@ test('replaced assets preserve old downloads, tampered caches are rehashed, dele
   const damaged = (await f.call('/api/release-cache')).body.files.find(item => item.cacheId === replaced.cacheId);
   assert.equal(damaged.modified, true);
   assert.equal(damaged.size, Buffer.byteLength('changed!!!'));
+  bytes = Buffer.from('bad payload');
   await f.call('/api/release-download', 'POST', { releaseId: 401 });
   const corrupt = await f.waitFor(state => state.status === 'failed');
   assert.match(corrupt.error, /校验失败/);
   assert.equal(await fs.readFile(replaced.path, 'utf8'), 'changed!!!');
+  // 大小和版本头均可能正常，应用时仍须校验内容；重下成功才替换旧文件。
+  bytes = Buffer.from('version two');
+  await fs.writeFile(replaced.path, 'version BAD');
+  assert.equal((await f.call('/api/release-cache')).body.files.find(item => item.cacheId === replaced.cacheId).modified, false);
+  await f.call('/api/release-download', 'POST', { releaseId: 401 });
+  const repaired = await f.waitFor(state => state.status === 'completed');
+  assert.equal(repaired.cacheId, replaced.cacheId);
+  assert.deepEqual(await fs.readFile(replaced.path), bytes);
   for (const cacheId of ['../outside', original.path, 'C:\\Windows', 'not-a-cache']) {
     assert.equal((await f.call('/api/release-cache', 'DELETE', { cacheId })).status, 400);
   }
